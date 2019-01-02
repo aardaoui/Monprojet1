@@ -1,0 +1,279 @@
+package com.bpc.ayh.batch;
+
+import javax.annotation.PostConstruct;
+import javax.persistence.EntityManagerFactory;
+
+import org.apache.cxf.jaxws.JaxWsProxyFactoryBean;
+import org.hibernate.SessionFactory;
+import org.springframework.batch.core.Job;
+import org.springframework.batch.core.Step;
+import org.springframework.batch.core.configuration.annotation.DefaultBatchConfigurer;
+import org.springframework.batch.core.configuration.annotation.EnableBatchProcessing;
+import org.springframework.batch.core.configuration.annotation.JobBuilderFactory;
+import org.springframework.batch.core.configuration.annotation.StepBuilderFactory;
+import org.springframework.batch.core.configuration.annotation.StepScope;
+import org.springframework.batch.core.explore.JobExplorer;
+import org.springframework.batch.core.launch.support.RunIdIncrementer;
+import org.springframework.batch.core.launch.support.SimpleJobOperator;
+import org.springframework.batch.core.repository.JobRepository;
+import org.springframework.batch.item.ItemWriter;
+import org.springframework.batch.item.file.FlatFileItemReader;
+import org.springframework.batch.item.file.FlatFileParseException;
+import org.springframework.batch.item.file.LineMapper;
+import org.springframework.batch.item.file.mapping.DefaultLineMapper;
+import org.springframework.batch.item.file.transform.BeanWrapperFieldExtractor;
+import org.springframework.batch.item.file.transform.DelimitedLineAggregator;
+import org.springframework.batch.item.file.transform.DelimitedLineTokenizer;
+import org.springframework.batch.item.support.ClassifierCompositeItemWriter;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.classify.Classifier;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
+import org.springframework.context.annotation.PropertySource;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.core.io.FileSystemResource;
+import org.springframework.core.io.Resource;
+import org.springframework.transaction.PlatformTransactionManager;
+
+import com.bnppa.referentiels.services.locator.ReferentielsServices;
+import com.bpc.ayh.batch.classifier.CustomClassifier;
+import com.bpc.ayh.batch.listeners.ProcessFluxListener;
+import com.bpc.ayh.batch.mappers.FromFluxPrivisionnelFieldSetMapper;
+import com.bpc.ayh.batch.processes.FluxPrevisionnelProcessor;
+import com.bpc.ayh.batch.readers.CustomPropertyPlaceholderConfigurer;
+import com.bpc.ayh.batch.writers.CustomFlatFileItemWriter;
+import com.bpc.ayh.batch.writers.CustomHibernateItemWriter;
+import com.bpc.ayh.common.dto.FluxPrevisionnelDto;
+import com.bpc.ayh.common.util.CachableInfo;
+import com.bpc.ayh.service.BatchTraitementService;
+import com.bpc.ayh.service.FluxService;
+import com.bpc.ayh.service.ReferentielCodesService;
+import com.bpc.ayh.service.ReferentielConfiguesService;
+import com.bpc.cro.webservice.impl.RuleEngineWSImplPortType;
+
+@Configuration
+@EnableBatchProcessing
+@EnableConfigurationProperties
+@PropertySource("classpath:Referentiels.properties")
+@Import({ FluxRealBatchConfiguration.class, FraisGestionBatchConfiguration.class })
+public class BatchConfiguration extends DefaultBatchConfigurer {
+
+	@Autowired
+	JobExplorer jobExplorer;
+
+	@Autowired
+	SimpleJobOperator jobOperator;
+
+	@Autowired
+	EntityManagerFactory entityManagerFactory;
+
+	@Value("${batch.newMatiass.fluxpav.in.attributes}")
+	private String[] fluxPavInAttributes;
+
+	@Value("${batch.newMatiass.batch.in.out.delimiter}")
+	private String delimiter;
+
+	// writer properties
+
+	@Value("${batch.newMatiass.fluxprev.out.attributes}")
+	private String[] names;
+
+	@Value("${batch.newmatiass.fluxprev.type}")
+	private String fluxType;
+
+	@Value("${batch.refcro.url}")
+	private String refCroUrl;
+
+	@Value("${batch.data.dateFormat}")
+	private String dataDateFormat;
+
+	@Autowired
+	ReferentielConfiguesService referentielConfiguesService;
+
+	@Autowired
+	ReferentielCodesService referentielCodesService;
+
+	/**
+	 * Récupéraion de toutes les valuers numérques pour la configuration des limites
+	 * (to skip, commit interval ...)
+	 */
+	@PostConstruct
+	public void chargerReferentielBornes() {
+		CachableInfo.activeConfig = referentielConfiguesService.getActifConfig();
+		return;
+	}
+
+	/**
+	 * 
+	 * @return
+	 */
+	@Bean(name = "ruleEngineWSImplProxy")
+	public RuleEngineWSImplPortType ruleEngineWSImplProxy() {
+		JaxWsProxyFactoryBean jaxWsProxyFactoryBean = new JaxWsProxyFactoryBean();
+		jaxWsProxyFactoryBean.setServiceClass(RuleEngineWSImplPortType.class);
+		jaxWsProxyFactoryBean.setAddress(refCroUrl);
+
+		return (RuleEngineWSImplPortType) jaxWsProxyFactoryBean.create();
+	}
+
+	@Bean
+	public static CustomPropertyPlaceholderConfigurer propertyConfigurer() {
+		CustomPropertyPlaceholderConfigurer propertyConfigurer = new CustomPropertyPlaceholderConfigurer();
+		propertyConfigurer.setSystemPropertiesModeName("SYSTEM_PROPERTIES_MODE_OVERRIDE");
+		propertyConfigurer.setLocations(new ClassPathResource("application.properties"),
+				new ClassPathResource("Referentiels.properties"));
+		propertyConfigurer.setIgnoreUnresolvablePlaceholders(true);
+		return propertyConfigurer;
+	}
+
+	@Bean
+	public ReferentielsServices referentielsServices() {
+		ReferentielsServices referentielsServices = new ReferentielsServices();
+		return referentielsServices;
+	}
+
+	@Bean
+	public LineMapper<FluxPrevisionnelDto> fluxPrevLineMapper() {
+		// lineMapper
+		DefaultLineMapper<FluxPrevisionnelDto> lineMapper = new DefaultLineMapper<FluxPrevisionnelDto>();
+		// lineTokenizer
+		DelimitedLineTokenizer lineTokenizer = new DelimitedLineTokenizer();
+		lineTokenizer.setNames(fluxPavInAttributes);
+		lineTokenizer.setDelimiter(delimiter);
+		lineMapper.setLineTokenizer(lineTokenizer);
+		// fieldSetMapper
+		FromFluxPrivisionnelFieldSetMapper fieldSetMapper = new FromFluxPrivisionnelFieldSetMapper();
+		fieldSetMapper.setDataDateFormat(dataDateFormat);
+		lineMapper.setFieldSetMapper(fieldSetMapper);
+		return lineMapper;
+	}
+
+	/* Récupèration du nom du fichier depuis lejobParameters */
+	@Bean
+	@StepScope
+	public Resource fluxPrevCsvIn(@Value("${batch.path.in}/#{jobParameters[fileName]}") String fileName) {
+		return new FileSystemResource(fileName);
+	}
+
+	/* Readers */
+	@Bean
+	@StepScope
+	public FlatFileItemReader<FluxPrevisionnelDto> fluxPrevReader(
+			LineMapper<FluxPrevisionnelDto> lineMapper) {
+		FlatFileItemReader<FluxPrevisionnelDto> csvfluxPrevFileReader = new FlatFileItemReader<>();
+		csvfluxPrevFileReader.setName("flatItemReader");
+		String fullCsvInPathFile = "";
+		csvfluxPrevFileReader.setResource(fluxPrevCsvIn(fullCsvInPathFile));
+		csvfluxPrevFileReader.setLineMapper(lineMapper);
+		return csvfluxPrevFileReader;
+	}
+
+
+	@Bean
+	public FluxPrevisionnelProcessor fluxPrevProcessor() {
+		return new FluxPrevisionnelProcessor();
+	}
+
+	@Bean(name = "customPrevClassifier")
+	public CustomClassifier<FluxPrevisionnelDto> customPrevClassifier(
+			CustomFlatFileItemWriter<FluxPrevisionnelDto> customFlatFileItemWriter,
+			CustomHibernateItemWriter<FluxPrevisionnelDto> oracleFluxPrivisionnelItemWriter) {
+		CustomClassifier<FluxPrevisionnelDto> classifier = new CustomClassifier<FluxPrevisionnelDto>();
+
+		classifier.setJdbcItemWriter(oracleFluxPrivisionnelItemWriter);
+		classifier.setFileItemWriter(customFlatFileItemWriter);
+		return classifier;
+	}
+
+	@Bean(name = "classifierPrevWriter")
+	public ClassifierCompositeItemWriter<FluxPrevisionnelDto> writer(
+			Classifier<FluxPrevisionnelDto, ItemWriter<? super FluxPrevisionnelDto>> customPrevClassifier) {
+		ClassifierCompositeItemWriter<FluxPrevisionnelDto> classifier = new ClassifierCompositeItemWriter<FluxPrevisionnelDto>();
+		classifier.setClassifier(customPrevClassifier);
+		return classifier;
+	}
+
+	@Bean(name = "oracleFluxPrivisionnelItemWriter")
+	public CustomHibernateItemWriter<FluxPrevisionnelDto> oracleFluxPrivisionnelItemWriter(FluxService fluxService) {
+		CustomHibernateItemWriter<FluxPrevisionnelDto> writer = new CustomHibernateItemWriter<FluxPrevisionnelDto>();
+		SessionFactory sessionFactory = entityManagerFactory.unwrap(SessionFactory.class);
+		writer.setFluxService(fluxService);
+		writer.setSessionFactory(sessionFactory);
+		writer.setTypeFlux("PREV");
+		return writer;
+	}
+
+	/* du nom du fichier e sortie dpeuis le fichier d'entrée */
+	@Bean
+	@StepScope
+	public Resource fluxPrevOut(@Value("${batch.path.out}/#{jobParameters[fileName]}") String fileName) {
+		return new FileSystemResource(fileName.replace(".csv", "_out.csv"));
+	}
+
+	@Bean(name = "customPrevflatFileItemWriter")
+	public CustomFlatFileItemWriter<FluxPrevisionnelDto> CustomFlatFileItemWriter(
+			BatchTraitementService batchTraitementService) {
+		CustomFlatFileItemWriter<FluxPrevisionnelDto> writer = new CustomFlatFileItemWriter<FluxPrevisionnelDto>();
+		writer.setCompteRenduService(batchTraitementService);
+		String fluxOutPathFile = "";
+		writer.setResource(fluxPrevOut(fluxOutPathFile));
+		writer.setAppendAllowed(true);
+		writer.setShouldDeleteIfEmpty(true);
+		DelimitedLineAggregator<FluxPrevisionnelDto> aggregator = new DelimitedLineAggregator<FluxPrevisionnelDto>();
+		aggregator.setDelimiter(delimiter);
+		BeanWrapperFieldExtractor<FluxPrevisionnelDto> extractor = new BeanWrapperFieldExtractor<FluxPrevisionnelDto>();
+		extractor.setNames(names);
+		aggregator.setFieldExtractor(extractor);
+		writer.setLineAggregator(aggregator);
+		return writer;
+	}
+
+	@Bean(name = "processListener")
+	public ProcessFluxListener processListener() {
+		ProcessFluxListener listener = new ProcessFluxListener();
+
+		listener.setFluxType(fluxType);
+		listener.setListReglesFiltrage(null);
+
+		return listener;
+	}
+
+	// tag::jobstep[]
+	@Bean
+	public Job fluxPrevisionnelJob(JobRepository jobRepository, ProcessFluxListener processListener,
+			Step stepFluxPrev) {
+		JobBuilderFactory jobBuilderFactory = new JobBuilderFactory(jobRepository);
+		return jobBuilderFactory.get("fluxPrevisionnelJob").repository(jobRepository)
+				.incrementer(new RunIdIncrementer()).listener(processListener).flow(stepFluxPrev).end().build();
+	}
+
+	@Autowired
+	CustomFlatFileItemWriter<FluxPrevisionnelDto> customPrevflatFileItemWriter;
+
+	@Autowired
+	PlatformTransactionManager transactionManager;
+
+	@Autowired
+	JobRepository jobRepository;
+
+	/* Récupèration du nom du fichier depuis lejobParameters */
+
+	@Bean
+	public Step stepFluxPrev(FlatFileItemReader<FluxPrevisionnelDto> reader,
+			ClassifierCompositeItemWriter<FluxPrevisionnelDto> writer, // TaskExecutor taskExecutor,
+			FluxPrevisionnelProcessor processor) {
+
+		StepBuilderFactory stepBuilderFactory = new StepBuilderFactory(jobRepository, transactionManager);
+		return stepBuilderFactory.get("stepFluxPrev")
+				.<FluxPrevisionnelDto, FluxPrevisionnelDto>chunk(CachableInfo.activeConfig.getFluxPervCommitInterval())
+				.reader(reader).faultTolerant().skip(FlatFileParseException.class)
+				.skipLimit(CachableInfo.activeConfig.getFluxPrevToSkiLimit()).processor(processor).writer(writer)
+				//.taskExecutor(taskExecutor)
+				.stream(customPrevflatFileItemWriter).build();
+	}
+	// end::jobstep[]R
+
+}
